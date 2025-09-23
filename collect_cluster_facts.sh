@@ -10,12 +10,13 @@ fi
 req() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1" >&2; exit 2; }; }
 req kubectl; req jq; req awk; req sed
 
-kjson()   { kubectl --context "$CTX" -o json "$@"; }
-kraw()    { kubectl --context "$CTX" get --raw "$1"; }
-kget()    { kubectl --context "$CTX" get "$@"; }
+kjson() { kubectl --context "$CTX" -o json get "$@"; }
+kraw()  { kubectl --context "$CTX" get --raw "$1"; }
+kget()  { kubectl --context "$CTX" get "$@"; }
 
-emit() { printf "%s=%s\n" "$1" "${2//[$'\n\r']/ }"; }
+emit()  { printf "%s=%s\n" "$1" "${2//[$'\n\r']/ }"| tee -a $OUT; }
 
+rm -rf $OUT
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -26,7 +27,7 @@ platform="$(jq -r '.serverVersion.platform // empty' <<<"$ver")"
 emit cluster.gitVersion "${gitVersion:-unknown}"
 emit cluster.platform   "${platform:-unknown}"
 
-# API groups/versions (preferred) and all GVs
+# ---- API groups/versions (preferred) and all GVs
 apis="$(kraw /apis || echo '{}')"
 core="$(kraw /api  || echo '{}')"
 gv_core="v1"
@@ -36,14 +37,14 @@ emit apis.preferred "${gv_core};${gv_groups}"
 emit apis.all       "${gv_all}"
 
 # Short list of “must-have” resources on new cluster (existence only)
-must_res=(deployments.apps statefulsets.apps daemonsets.apps jobs.batch cronjobs.batch ingresses.networking.k8s.io)
-for r in "${must_res[@]}"; do
-  if kubectl --context "$CTX" api-resources --no-headers 2>/dev/null | awk '{print $1"."$NF}' | grep -qx "$r"; then
-    emit "apiresource.${r}" "present"
-  else
-    emit "apiresource.${r}" "missing"
-  fi
-done
+#must_res=(deployments.apps statefulsets.apps daemonsets.apps jobs.batch cronjobs.batch ingresses.networking.k8s.io)
+#for r in "${must_res[@]}"; do
+#  if kubectl --context "$CTX" api-resources --no-headers 2>/dev/null | awk '{print $1"."$NF}' | grep -qx "$r"; then
+#    emit "apiresource.${r}" "present"
+#  else
+#    emit "apiresource.${r}" "missing"
+#  fi
+#done
 
 # ---- Nodes / capacity
 nodes="$(kjson nodes || echo '{"items":[]}')"
@@ -51,8 +52,9 @@ node_count="$(jq '.items|length' <<<"$nodes")"
 emit capacity.nodes "$node_count"
 
 alloc_cpu_m="$(jq '[.items[].status.allocatable.cpu] | map(
-  (match("m$")? // empty) as $m
-  | if (test("m$")) then (sub("m$";"")|tonumber) else ((. | sub("(^[0-9]+)$";"\1000"); tonumber)) end
+  . as $m |
+  if $m|test("m$") then (sub("m$";"")|tonumber)
+  else ($m|tonumber) end
 ) | add // 0' <<<"$nodes")"
 alloc_mem_b="$(jq '[.items[].status.allocatable.memory] | map(
   . as $s |
@@ -105,7 +107,7 @@ addons="$(jq -r '[.items[] |
 addon_list="$(jq -r '[ .[] | "\(.name)=\((.images|join("|")))" ] | sort | join(";")' <<<"$addons")"
 emit addons.kubesystem "$addon_list"
 
-# Metrics-server & CoreDNS versions (handy signals)
+# ---- Metrics-server & CoreDNS versions (handy signals)
 ms_ver="$(kubectl --context "$CTX" -n kube-system get deploy -o json 2>/dev/null \
   | jq -r '.items[] | select(.metadata.name|test("metrics-server")).spec.template.spec.containers[].image' | paste -sd ';' -)"
 cdns_ver="$(kubectl --context "$CTX" -n kube-system get deploy -o json 2>/dev/null \
@@ -122,13 +124,13 @@ emit policy.podSecurity.defaultNS "${psa_default:-none}"
 
 mut_webhooks="$(kjson mutatingwebhookconfigurations.admissionregistration.k8s.io 2>/dev/null || echo '{"items":[]}')"
 val_webhooks="$(kjson validatingwebhookconfigurations.admissionregistration.k8s.io 2>/dev/null || echo '{"items":[]}')"
-emit admission.mutatingwebhooks.count   "$(jq '.items|length' <<<"$mut_webhooks")"
-emit admission.validatingwebhooks.count "$(jq '.items|length' <<<"$val_webhooks")"
+emit admission.mutatingwebhooks   "$(jq -r '[.items[].metadata.name]|sort|join(";")' <<<"$mut_webhooks")"
+emit admission.validatingwebhooks "$(jq -r '[.items[].metadata.name]|sort|join(";")' <<<"$val_webhooks")"
 
 # ---- CRDs (count + a sample)
 crds="$(kjson crd 2>/dev/null || echo '{"items":[]}')"
 emit crds.count "$(jq '.items|length' <<<"$crds")"
-emit crds.sample "$(jq -r '[.items[].metadata.name] | sort | .[0:15] | join(";")' <<<"$crds")"
+emit crds.list "$(jq -r '[.items[].metadata.name] | sort | join(";")' <<<"$crds")"
 
 # ---- Namespaces: quotas/limitranges signal
 for ns in default kube-system; do
@@ -138,11 +140,4 @@ for ns in default kube-system; do
   emit "ns.${ns}.limitranges"    "$(jq -r '[.items[].metadata.name]|sort|join(";")' <<<"$lr")"
 done
 
-# ---- Save
-sort -u > "$OUT" <<EOF
-$(declare -f emit >/dev/null; true)
-EOF
-
-# Re-emit sorted (we already printed via emit, but redirecting above simplifies)
-# Instead, we captured nothing; so re-run collection as above? Simpler: write on the fly.
-# We'll just say the file is already written because emit printed to stdout redirected.
+sort -u -o "$OUT" "$OUT"
